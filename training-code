@@ -1,0 +1,185 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch import nn, optim
+from torch_geometric.nn import GATConv
+from torch_geometric.data import DataLoader
+from scipy.stats import spearmanr
+from tqdm import tqdm
+import scanpy as sc
+
+# ------------------------------
+# Define GNN model
+# ------------------------------
+class s_GNN(torch.nn.Module):
+    def __init__(self, feature_size, num_classes=1000):
+        super(s_GNN, self).__init__()
+        self.num_classes = num_classes
+        hl_embedding_size = feature_size // 4
+
+        self.linear1 = nn.Linear(feature_size, hl_embedding_size)
+        self.layer_norm1 = nn.LayerNorm(hl_embedding_size)
+
+        self.conv1 = GATConv(hl_embedding_size, hl_embedding_size, heads=3, dropout=0.3)
+        self.head_transform1 = nn.Linear(hl_embedding_size * 3, hl_embedding_size)
+
+        self.conv2 = GATConv(hl_embedding_size, hl_embedding_size, heads=3, dropout=0.3)
+        self.head_transform2 = nn.Linear(hl_embedding_size * 3, hl_embedding_size)
+
+        self.linear2 = nn.Linear(hl_embedding_size, self.num_classes)
+        self.linear3 = nn.Linear(self.num_classes, self.num_classes)
+
+    def forward(self, x, edge_index, batch):
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.head_transform1(self.conv1(x, edge_index)))
+        x = self.layer_norm1(x)
+        x = F.relu(self.head_transform2(self.conv2(x, edge_index)))
+        x = self.layer_norm1(x)
+        x = F.relu(self.linear2(x))
+        x = F.dropout(x, p=0.5)
+        x = self.linear3(x)
+        return x
+
+# ------------------------------
+# Load data split
+# ------------------------------
+def load_split_data(idx, splits, all_matrices):
+    train_list = [i for i in all_matrices if i not in splits[idx]]
+    test_list = [i for i in all_matrices if i in splits[idx]]
+    exclude_list = ["51_A10-38_0", "127_A8-6_0", "36_B19-49_A13_0"]
+    
+    train_list = [i for i in train_list if "_".join(i.split("_")[:-2]) not in exclude_list]
+    test_list = [i for i in test_list if "_".join(i.split("_")[:-2]) not in exclude_list]
+
+    graph_base_dir = f"/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/GNN/models/top_1000_resnet50/graph_data/fold_{idx}/"
+
+    train_graphs = [torch.load(graph_base_dir + "_".join(f.split("_")[:-2]) + ".pt") for f in train_list]
+    test_graphs = [torch.load(graph_base_dir + "_".join(f.split("_")[:-2]) + ".pt") for f in test_list]
+
+    return train_graphs, test_graphs
+
+# ------------------------------
+# Training
+# ------------------------------
+def train_model(model, device, train_loader, test_loader, gene_order, path, fold):
+    num_epochs = 100
+    loss_fn = nn.MSELoss()
+    opt = optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=10, T_mult=1, eta_min=1e-6, verbose=True)
+    softplus = nn.Softplus()
+    best_median = 0.0
+
+    for epoch in tqdm(range(num_epochs)):
+        model.train()
+        epoch_loss = []
+
+        for data in train_loader:
+            x, edge_index, y, batch = data.x.to(device), data.edge_index.to(device), data.y.to(device), data.batch.to(device)
+            x = x.to(torch.float32)
+            y = y.to(torch.float32)
+            scores = softplus(model(x, edge_index, batch))
+            loss = loss_fn(scores, y)
+            epoch_loss.append(loss.item())
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        
+        scheduler.step()
+        print(f"Epoch {epoch} - Loss: {sum(epoch_loss)/len(epoch_loss):.4f}")
+
+        if epoch % 10 == 0 and epoch > 0:
+            corr, pvals = test_model(model, device, test_loader, epoch)
+            median = np.percentile(corr, 50)
+            if median > best_median:
+                best_median = median
+                print(f"Saving best model (epoch {epoch})...")
+                results_df = pd.DataFrame({'gene': gene_order, 'spearmanr': corr, 'p': pvals})
+                torch.save(model.state_dict(), f"{path}/model_fold_{fold}.pt")
+                results_df.to_csv(f"{path}/fold_{fold}_results.csv", index=False)
+
+    return model, best_median
+
+# ------------------------------
+# Testing
+# ------------------------------
+def test_model(model, device, test_loader, epoch):
+    model.eval()
+    preds, gts = torch.Tensor([]), torch.Tensor([])
+    softplus = nn.Softplus()
+
+    with torch.no_grad():
+        for data in test_loader:
+            x, edge_index, y, batch = data.x.to(device), data.edge_index.to(device), data.y.to(device), data.batch.to(device)
+            x = x.to(torch.float32)
+            y = y.to(torch.float32)
+            scores = softplus(model(x, edge_index, batch)).cpu()
+            y = y.cpu()
+            preds = torch.cat((preds, scores))
+            gts = torch.cat((gts, y))
+
+    preds, gts = preds.numpy(), gts.numpy()
+    corrs = [spearmanr(preds[:, i], gts[:, i])[0] for i in range(preds.shape[1])]
+    pvals = [spearmanr(preds[:, i], gts[:, i])[1] for i in range(preds.shape[1])]
+
+    print(f"Epoch {epoch} - Spearman: 25%={np.percentile(corrs,25):.3f}, 50%={np.percentile(corrs,50):.3f}, 75%={np.percentile(corrs,75):.3f}")
+    return corrs, pvals
+
+# ------------------------------
+# Cross-validation Runner
+# ------------------------------
+def run_cv():
+    splits = np.load("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/cross_validation/splits.npy", allow_pickle=True) 
+    matrices = os.listdir("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/data/matrices")
+    adata = sc.read_h5ad("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/gene_selection/final_top_1000_all_genes_filtered/data/adatas/0_B11-10_A5_0_adata.h5ad")
+    gene_order = list(adata.var.index)
+    save_path = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/GNN/models/top_1000_resnet50/run"
+
+    for i in range(5):
+        model_path = f"{save_path}/model_fold_{i}.pt"
+        if os.path.exists(model_path):
+            print(f"Fold {i} already trained.")
+            continue
+
+        print(f"\n--- Running Fold {i} ---")
+        train_graphs, test_graphs = load_split_data(i, splits, matrices)
+        train_loader = DataLoader(train_graphs, batch_size=2)
+        test_loader = DataLoader(test_graphs, batch_size=2)
+
+        device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        model = s_GNN(2048).to(device)
+        model, best_median = train_model(model, device, train_loader, test_loader, gene_order, save_path, fold=i)
+
+        corr, pvals = test_model(model, device, test_loader, epoch="final")
+        if np.percentile(corr, 50) > best_median:
+            print(f"Saving final model for Fold {i}...")
+            results_df = pd.DataFrame({'gene': gene_order, 'spearmanr': corr, 'p': pvals})
+            torch.save(model.state_dict(), model_path)
+            results_df.to_csv(f"{save_path}/fold_{i}_results.csv", index=False)
+
+    # Aggregate stats
+    print("\n--- Creating Final Summary ---")
+    gene_spearman, gene_p = {}, {}
+
+    for i in range(5):
+        df = pd.read_csv(f"{save_path}/fold_{i}_results.csv")
+        for g, s, p in zip(df["gene"], df["spearmanr"], df["p"]):
+            gene_spearman.setdefault(g, []).append(s)
+            gene_p.setdefault(g, []).append(p)
+
+    final_df = pd.DataFrame({
+        "gene": gene_order,
+        "spearmanr_mean": [np.mean(gene_spearman[g]) for g in gene_order],
+        "p_mean": [np.mean(gene_p[g]) for g in gene_order]
+    })
+    final_df.to_csv(f"{save_path}/mean_results.csv", index=False)
+
+# ------------------------------
+# Entry Point
+# ------------------------------
+if __name__ == "__main__":
+    run_cv()
