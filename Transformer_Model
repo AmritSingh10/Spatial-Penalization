@@ -1,1 +1,139 @@
+!pip install numpy
+!pip install matplotlib
+!pip install torch
 
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# 1. Extract Patches from WSI Images
+# ----------------------------
+
+data_dir = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/spatial_omics/DH/held_out_wsi"
+npy_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".npy")])[:20]  # first 20
+
+expression_list = []
+
+for file in npy_files:
+    path = os.path.join(data_dir, file)
+    try:
+        img = np.load(path, mmap_mode='r')  # shape: [H, W, 3]
+
+        # Extract 100 patches of 32x32 from top-left corner
+        patches = []
+        for i in range(0, 320, 32):
+            for j in range(0, 320, 32):
+                patch = img[i:i+32, j:j+32, :]
+                if patch.shape == (32, 32, 3):
+                    flat = patch.reshape(-1)  # shape: [3072]
+                    patches.append(flat)
+        patches = np.stack(patches)  # shape: [100, 3072]
+        expression_list.append(patches)
+
+    except Exception as e:
+        print(f"Skipping {file}: {e}")
+
+print(f"Loaded {len(expression_list)} pseudo-expression arrays.")
+
+
+# ----------------------------
+# 2. Custom Dataset with Masking
+# ----------------------------
+
+class GeneExpressionDataset(Dataset):
+    def __init__(self, expression_data, mask_ratio=0.15):
+        self.expression_data = expression_data
+        self.mask_ratio = mask_ratio
+
+    def __len__(self):
+        return len(self.expression_data)
+
+    def __getitem__(self, idx):
+        expr = self.expression_data[idx]  # shape [N, P]
+        expr = torch.tensor(expr, dtype=torch.float32)
+
+        mask = torch.rand(expr.shape) < self.mask_ratio
+        masked_expr = expr.clone()
+        masked_expr[mask] = 0.0
+
+        return masked_expr, expr, mask
+
+
+# ----------------------------
+# 3. Transformer Model
+# ----------------------------
+
+class ExpressionTransformer(nn.Module):
+    def __init__(self, num_pathways, dim=128, depth=4, heads=4, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(num_pathways, dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.output_proj = nn.Linear(dim, num_pathways)
+
+    def forward(self, x):
+        x = self.input_proj(x)         # [B, N, dim]
+        x = self.transformer(x)        # [B, N, dim]
+        x = self.output_proj(x)        # [B, N, P]
+        return x
+
+
+
+# ----------------------------
+# 4. Masked MSE Loss
+# ----------------------------
+
+def masked_mse_loss(pred, target, mask):
+    return ((pred - target)**2)[mask].mean()
+
+
+
+# ----------------------------
+# 5. Training Loop
+# ----------------------------
+
+num_pathways = expression_list[0].shape[1]
+batch_size = 2
+
+dataset = GeneExpressionDataset(expression_list, mask_ratio=0.15)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+model = ExpressionTransformer(num_pathways=num_pathways).cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+model.train()
+for epoch in range(10):
+    total_loss = 0
+    for masked_input, original, mask in dataloader:
+        masked_input = masked_input.cuda()
+        original = original.cuda()
+        mask = mask.cuda()
+
+        pred = model(masked_input)
+        loss = masked_mse_loss(pred, original, mask)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(dataloader)
+    print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
+
+
+
+with torch.no_grad():
+    masked_input, original, mask = dataset[0]
+    masked_input = masked_input.unsqueeze(0).cuda()
+    output = model(masked_input).squeeze(0).cpu().numpy()
+
+plt.plot(original.numpy()[0], label="True")
+plt.plot(output[0], label="Predicted")
+plt.legend()
+plt.title("Pathway Expression: First Spot")
+plt.show()
