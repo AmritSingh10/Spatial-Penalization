@@ -1,139 +1,127 @@
-!pip install numpy
-!pip install matplotlib
-!pip install torch
+# Imports & Config
 
-import os
+import os, glob, random
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-# ----------------------------
-# 1. Extract Patches from WSI Images
-# ----------------------------
+# Force CPU for simplicity & to avoid cuda/cpu mismatches
+device = torch.device("cpu")
 
-data_dir = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/spatial_omics/DH/held_out_wsi"
-npy_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".npy")])[:20]  # first 20
+# Path to your patch folders
+BASE_DIR = (
+    "/dartfs/rc/nosnapshots/V/VaickusL-nb/"
+    "EDIT_Students/projects/multimodal/tme_study/colon_st/"
+    "dh_colon/patches/"
+)
+
+# We'll take the first 30 subfolders (cells)
+all_cells = sorted(os.listdir(BASE_DIR))[:30]
+print(f"Found {len(all_cells)} cell folders, e.g.: {all_cells[:5]} …")
+
+
+# Load & Preprocess Patches
+
+# how many patches per cell?
+PATCHES_PER_CELL = 40
+# target patch size
+PATCH_SIZE = (32, 32)
 
 expression_list = []
 
-for file in npy_files:
-    path = os.path.join(data_dir, file)
-    try:
-        img = np.load(path, mmap_mode='r')  # shape: [H, W, 3]
+for cell in all_cells:
+    cell_path = os.path.join(BASE_DIR, cell)
+    # collect .npy files
+    npy_files = sorted(glob.glob(os.path.join(cell_path, "*.npy"))) 
+    # sample up to PATCHES_PER_CELL
+    npy_files = npy_files[:PATCHES_PER_CELL]
+    
+    for p in npy_files:
+        arr = np.load(p, mmap_mode="r")  # assumed shape (H, W, 3)
+        # if needed, resize to 32×32 using simple slicing or skimage; here assume already ~32×32
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            # normalize to [0,1]
+            arr = arr.astype(np.float32) / 255.0
+            # if not exactly 32×32, you could downsample via slicing:
+            arr = arr[:PATCH_SIZE[0], :PATCH_SIZE[1], :]
+            flat = arr.reshape(-1)  # (32*32*3 = 3072,)
+            expression_list.append(flat)
 
-        # Extract 100 patches of 32x32 from top-left corner
-        patches = []
-        for i in range(0, 320, 32):
-            for j in range(0, 320, 32):
-                patch = img[i:i+32, j:j+32, :]
-                if patch.shape == (32, 32, 3):
-                    flat = patch.reshape(-1)  # shape: [3072]
-                    patches.append(flat)
-        patches = np.stack(patches)  # shape: [100, 3072]
-        expression_list.append(patches)
-
-    except Exception as e:
-        print(f"Skipping {file}: {e}")
-
-print(f"Loaded {len(expression_list)} pseudo-expression arrays.")
+print(f"✅ Loaded {len(expression_list)} total patches.")
 
 
-# ----------------------------
-# 2. Custom Dataset with Masking
-# ----------------------------
-
-class GeneExpressionDataset(Dataset):
-    def __init__(self, expression_data, mask_ratio=0.15):
-        self.expression_data = expression_data
-        self.mask_ratio = mask_ratio
+class PatchDataset(Dataset):
+    def __init__(self, vectors):
+        self.vectors = vectors
 
     def __len__(self):
-        return len(self.expression_data)
+        return len(self.vectors)
 
     def __getitem__(self, idx):
-        expr = self.expression_data[idx]  # shape [N, P]
-        expr = torch.tensor(expr, dtype=torch.float32)
+        x = torch.tensor(self.vectors[idx], dtype=torch.float32)
+        return x, x  # auto-encoding
 
-        mask = torch.rand(expr.shape) < self.mask_ratio
-        masked_expr = expr.clone()
-        masked_expr[mask] = 0.0
-
-        return masked_expr, expr, mask
+dataset = PatchDataset(expression_list)
+dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+print(f"Dataset size: {len(dataset)} samples; batches of {dataloader.batch_size}")
 
 
-# ----------------------------
-# 3. Transformer Model
-# ----------------------------
-
-class ExpressionTransformer(nn.Module):
-    def __init__(self, num_pathways, dim=128, depth=4, heads=4, dropout=0.1):
+class PatchTransformer(nn.Module):
+    def __init__(self, input_dim=3072, model_dim=128, nhead=4, depth=3, dropout=0.1):
         super().__init__()
-        self.input_proj = nn.Linear(num_pathways, dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dropout=dropout, batch_first=True)
+        self.input_proj = nn.Linear(input_dim, model_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim, nhead=nhead, dropout=dropout, batch_first=True
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.output_proj = nn.Linear(dim, num_pathways)
+        self.output_proj = nn.Linear(model_dim, input_dim)
 
     def forward(self, x):
-        x = self.input_proj(x)         # [B, N, dim]
-        x = self.transformer(x)        # [B, N, dim]
-        x = self.output_proj(x)        # [B, N, P]
+        # x: [B, 3072]
+        x = self.input_proj(x).unsqueeze(1)   # → [B, 1, D]
+        x = self.transformer(x)               # → [B, 1, D]
+        x = self.output_proj(x.squeeze(1))    # → [B, 3072]
         return x
 
+model = PatchTransformer().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn   = nn.MSELoss()
 
 
-# ----------------------------
-# 4. Masked MSE Loss
-# ----------------------------
-
-def masked_mse_loss(pred, target, mask):
-    return ((pred - target)**2)[mask].mean()
-
-
-
-# ----------------------------
-# 5. Training Loop
-# ----------------------------
-
-num_pathways = expression_list[0].shape[1]
-batch_size = 2
-
-dataset = GeneExpressionDataset(expression_list, mask_ratio=0.15)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-model = ExpressionTransformer(num_pathways=num_pathways).cuda()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 model.train()
-for epoch in range(10):
-    total_loss = 0
-    for masked_input, original, mask in dataloader:
-        masked_input = masked_input.cuda()
-        original = original.cuda()
-        mask = mask.cuda()
+for epoch in range(1, 11):
+    total_loss = 0.0
+    for x, y in dataloader:
+        x = x.to(device)
+        y = y.to(device)
 
-        pred = model(masked_input)
-        loss = masked_mse_loss(pred, original, mask)
+        pred = model(x)
+        loss = loss_fn(pred, y)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-
-    avg_loss = total_loss / len(dataloader)
-    print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
-
+    avg = total_loss / len(dataloader)
+    print(f"Epoch {epoch:2d} | Avg Loss: {avg:.6f}")
 
 
+
+model.eval()
 with torch.no_grad():
-    masked_input, original, mask = dataset[0]
-    masked_input = masked_input.unsqueeze(0).cuda()
-    output = model(masked_input).squeeze(0).cpu().numpy()
+    x, y = dataset[0]                       # [3072], [3072]
+    pred = model(x.unsqueeze(0).to(device)) # [1,3072]
+    pred = pred.cpu().squeeze(0).numpy()
 
-plt.plot(original.numpy()[0], label="True")
-plt.plot(output[0], label="Predicted")
+# true vs. predicted RGB means (first 3 dims)
+plt.figure(figsize=(5,4))
+plt.plot(y[:3].numpy(), label="True",   lw=2)
+plt.plot(pred[:3],       label="Pred", lw=2)
+plt.title("RGB Mean: True vs Pred (First Patch)")
+plt.xlabel("Channel (R, G, B)")
 plt.legend()
-plt.title("Pathway Expression: First Spot")
 plt.show()
