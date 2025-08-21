@@ -1,0 +1,490 @@
+import os, glob
+import numpy as np
+import scipy.sparse as sp
+import scanpy as sc
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# ──────────────────────
+# Hyperparameters/Paths
+# ──────────────────────
+H5AD_DIR    = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata"
+NUM_FILES   = 5        # For demo, can set to None for all
+MAX_SPOTS   = 200      # For demo, can set to None for all
+MASK_RATIO  = 0.15
+BATCH_SIZE  = 2
+EPOCHS      = 50
+MODEL_DIM   = 64
+TRANSFORMER_DEPTH = 2
+NUM_HEADS   = 4
+LEARNING_RATE = 1e-3
+SPATIAL_LOSS_WEIGHT = 1.0
+NEIGHBOR_DISTANCE_THRESHOLD = 10.5  # Change as needed for hex/Visium arrays
+device = torch.device("cpu")  # For debug, force CPU
+print("Using device:", device)
+
+# ──────────────────────
+# 1. Load Data
+# ──────────────────────
+# Gather .h5ad paths
+all_fns = sorted(glob.glob(os.path.join(H5AD_DIR, "*.h5ad")))
+if NUM_FILES:
+    all_fns = all_fns[:NUM_FILES]
+print(f"Loading {len(all_fns)} slides…")
+
+expr_matrices = []
+neighbor_matrices = []
+spot_coords = []
+for fn in all_fns:
+    adata = sc.read_h5ad(fn)
+    X = adata.X
+    if sp.issparse(X):
+        X = X.toarray()
+    # subsample spots if requested
+    if MAX_SPOTS and X.shape[0] > MAX_SPOTS:
+        X = X[:MAX_SPOTS, :]
+
+    # Normalization: log1p, scale to [0,1]
+    X = np.log1p(X)
+    X = X / X.max()
+
+    expr_matrices.append(X.astype(np.float32))
+
+    arr_row = adata.obs['array_row'].astype(float).values
+    arr_col = adata.obs['array_col'].astype(float).values
+    if MAX_SPOTS and len(arr_row) > MAX_SPOTS:
+        arr_row = arr_row[:MAX_SPOTS]
+        arr_col = arr_col[:MAX_SPOTS]
+    spot_coords.append((arr_row, arr_col))
+
+print(f"Sequence length (spots): {expr_matrices[0].shape[0]}, feature dim (genes): {expr_matrices[0].shape[1]}")
+SEQ_LEN     = expr_matrices[0].shape[0]
+FEATURE_DIM = expr_matrices[0].shape[1]
+
+# ──────────────────────
+# 2. Build Neighbors Matrix (distance-based)
+# ──────────────────────
+def build_neighbors_matrix(array_row, array_col, distance_threshold=1.5):
+    n_spots = len(array_row)
+    coords = np.stack([array_row, array_col], axis=1).astype(float)
+    dists = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+    # Spots are neighbors if distance is >0 and <=threshold
+    neighbors_matrix = (dists > 0) & (dists <= distance_threshold)
+    neighbors_matrix = neighbors_matrix.astype(float)
+    print("Neighbors matrix shape:", neighbors_matrix.shape)
+    print("Neighbors matrix sum:", neighbors_matrix.sum())
+    print("Neighbors matrix (first 5 rows):\n", neighbors_matrix[:5, :5])
+    return torch.tensor(neighbors_matrix, dtype=torch.float32)
+
+neighbor_matrices = [
+    build_neighbors_matrix(row, col, distance_threshold=NEIGHBOR_DISTANCE_THRESHOLD) for row, col in spot_coords
+]
+
+# ──────────────────────
+# 3. Dataset
+# ──────────────────────
+class MaskedExprDataset(Dataset):
+    def __init__(self, mats, mask_ratio=0.15, neighbor_matrices=None):
+        self.mats = mats
+        self.mask_ratio = mask_ratio
+        self.neighbor_matrices = neighbor_matrices
+    def __len__(self):
+        return len(self.mats)
+    def __getitem__(self, idx):
+        mat  = torch.from_numpy(self.mats[idx])            # [SEQ_LEN, FEATURE_DIM]
+        mask = (torch.rand_like(mat) < self.mask_ratio)    # bool [SEQ_LEN, FEATURE_DIM]
+        inp  = mat.clone()
+        inp[mask] = 0.0
+        neighbors = self.neighbor_matrices[idx] if self.neighbor_matrices else None
+        return inp, mat, mask, neighbors
+
+dataset = MaskedExprDataset(expr_matrices, mask_ratio=MASK_RATIO, neighbor_matrices=neighbor_matrices)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+print(f"Dataset size: {len(dataset)} samples; batch size {BATCH_SIZE}")
+
+# ──────────────────────
+# 4. Model (Transformer stand-in)
+# ──────────────────────
+class ExprTransformer(nn.Module):
+    def __init__(self, seq_len, feature_dim, model_dim, nhead, depth, dropout=0.1):
+        super().__init__()
+        self.input_proj  = nn.Linear(feature_dim, model_dim)
+        self.pos_embed   = nn.Parameter(torch.randn(1, seq_len, model_dim))
+        encoder_layer    = nn.TransformerEncoderLayer(
+                              d_model=model_dim,
+                              nhead=nhead,
+                              dropout=dropout,
+                              batch_first=True
+                          )
+        self.transformer = nn.TransformerEncoder(encoder_layer,
+                                                 num_layers=depth)
+        self.output_proj = nn.Linear(model_dim, feature_dim)
+
+    def forward(self, x):
+        # x: [B, SEQ_LEN, FEATURE_DIM]
+        x = self.input_proj(x) + self.pos_embed   # → [B, SEQ_LEN, MODEL_DIM]
+        x = self.transformer(x)                   # → [B, SEQ_LEN, MODEL_DIM]
+        return self.output_proj(x)                # → [B, SEQ_LEN, FEATURE_DIM]
+
+def masked_mse_loss(pred, target, mask):
+    diff = (pred - target)[mask]
+    return (diff * diff).mean()
+
+# ──────────────────────
+# 5. Spatial Incoherence Loss
+# ──────────────────────
+def compute_local_morans_I(expression_map, neighbors_matrix, eps=1e-8):
+    # expression_map: (B, N, G)
+    B, N, G = expression_map.shape
+    out = []
+    W = neighbors_matrix  # [N, N]
+    W_sum = W.sum()
+    for b in range(B):
+        vals = expression_map[b]  # [N, G]
+        mean = vals.mean(dim=0, keepdim=True)  # [1, G]
+        diff = vals - mean
+        num = torch.matmul(W, diff) * diff  # [N, G]
+        num = num.sum(dim=0)  # [G]
+        denom = (diff ** 2).sum(dim=0) + eps  # [G]
+        morans_I = (N / (W_sum + eps)) * (num / denom)
+        out.append(morans_I)
+    return torch.stack(out, dim=0) # [B, G]
+
+class SpatialIncoherenceLoss(nn.Module):
+    def __init__(self, loss_weight=1.0):
+        super().__init__()
+        self.loss_weight = loss_weight
+    def forward(self, pred, target, neighbors_matrix):
+        # pred, target: [B, N, G], neighbors_matrix: [N, N] (per-sample)
+        pred_morans = compute_local_morans_I(pred, neighbors_matrix)
+        target_morans = compute_local_morans_I(target, neighbors_matrix)
+        spatial_loss = nn.functional.mse_loss(pred_morans, target_morans)
+        return self.loss_weight * spatial_loss
+
+spatial_loss_fn = SpatialIncoherenceLoss(loss_weight=SPATIAL_LOSS_WEIGHT)
+
+# ──────────────────────
+# 6. Training Loop
+# ──────────────────────
+model = ExprTransformer(
+    seq_len=SEQ_LEN,
+    feature_dim=FEATURE_DIM,
+    model_dim=MODEL_DIM,
+    nhead=NUM_HEADS,
+    depth=TRANSFORMER_DEPTH
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    total_main, total_spatial, total = 0, 0, 0
+    for inp, orig, mask, neighbors in dataloader:
+        inp = inp.to(device)
+        orig = orig.to(device)
+        mask = mask.to(device)
+        pred = model(inp)  # [B, N, G]
+        main_loss = masked_mse_loss(pred, orig, mask)
+        # For each batch sample, compute spatial loss separately, then average
+        spatial_losses = []
+        for b in range(inp.shape[0]):
+            sl = spatial_loss_fn(
+                pred[b].unsqueeze(0), orig[b].unsqueeze(0), neighbors[b].to(device)
+            )
+            spatial_losses.append(sl)
+        spatial_loss = torch.stack(spatial_losses).mean()
+        loss = main_loss + spatial_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_main += main_loss.item()
+        total_spatial += spatial_loss.item()
+        total += loss.item()
+    n_batches = len(dataloader)
+    print(f"Epoch {epoch:2d} | Main Loss: {total_main/n_batches:.4f} | Spatial Loss: {total_spatial/n_batches:.4f} | Total: {total/n_batches:.4f}")
+
+#!/usr/bin/env python
+# coding: utf-8
+
+# Method 3: VRI with Spatial Incoherence (Moran's I) Loss
+
+import os, glob
+import numpy as np
+import scipy.sparse as sp
+import scanpy as sc
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from scipy.spatial.distance import cdist
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+
+# ────────────────
+# Hyperparameters
+# ────────────────
+H5AD_DIR    = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata"
+WSI_DIR     = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/spatial_omics/DH/held_out_wsi"
+NUM_FILES   = 1         # slides to use
+MAX_SPOTS   = 200       # cap per slide
+PATCH_SIZE  = 128
+DOWNSAMPLE  = 16
+NEIGHBORHOOD= 3
+BACKBONE_DIM= 64        # PCA/feature dim
+MODEL_DIM   = 128
+TRANSFORMER_DEPTH = 2
+NUM_HEADS   = 4
+DROPOUT     = 0.1
+LEARNING_RATE = 5e-4
+BATCH_SIZE  = 8
+EPOCHS      = 20
+SPATIAL_LOSS_WEIGHT = 1.0
+NEIGHBOR_DISTANCE_THRESHOLD = 3.5
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ─────────────────────────────────────────────
+# 1. Load slide, gene matrix, coords, PCA, scaler
+# ─────────────────────────────────────────────
+h5s = sorted(glob.glob(os.path.join(H5AD_DIR, "*.h5ad")))[:NUM_FILES]
+adata = sc.read_h5ad(h5s[0])
+X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+coords = adata.obs[['array_row', 'array_col']].astype(int).values
+
+if MAX_SPOTS and X.shape[0] > MAX_SPOTS:
+    X      = X[:MAX_SPOTS]
+    coords = coords[:MAX_SPOTS]
+
+print("Gene matrix:", X.shape, "Coords:", coords.shape)
+
+pca    = PCA(n_components=BACKBONE_DIM)
+P_raw  = pca.fit_transform(X.astype(np.float32))    # [N_spots × P]
+scaler = StandardScaler()
+P_target = scaler.fit_transform(P_raw)              # [N_spots × P]
+P_target = torch.from_numpy(P_target).float().to(device)
+
+print("PCA targets:", P_target.shape)
+
+# ─────────────
+# 2. Load WSI
+# ─────────────
+wsi_file = os.path.join(WSI_DIR, os.path.basename(h5s[0]).replace(".h5ad","_orig.npy"))
+wsi      = np.load(wsi_file, mmap_mode='r')         # [H,W,3]
+wsi_ds   = (wsi[::DOWNSAMPLE,::DOWNSAMPLE,:].astype(np.float32)/255.0)
+H_ds, W_ds, _ = wsi_ds.shape
+print("Downsampled WSI:", wsi_ds.shape)
+
+# ───────────────────────────────────────────
+# 3. Build per-spot neighborhood patch seqs
+# ───────────────────────────────────────────
+half    = PATCH_SIZE//2
+offs    = np.linspace(-half, half, NEIGHBORHOOD, dtype=int)
+N_spots = coords.shape[0]
+Ntok    = NEIGHBORHOOD**2
+
+patch_seqs = np.zeros((N_spots, Ntok, 3, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
+
+for i,(r,c) in enumerate(coords):
+    rr = r//DOWNSAMPLE
+    cc = c//DOWNSAMPLE
+    seq = []
+    for dr in offs:
+        for dc in offs:
+            y0, x0 = rr+dr-half, cc+dc-half
+            y1, x1 = y0+PATCH_SIZE, x0+PATCH_SIZE
+            pt, pl = max(0,-y0), max(0,-x0)
+            pb, pr = max(0,y1-H_ds), max(0,x1-W_ds)
+            y0c, x0c = max(0,y0), max(0,x0)
+            y1c, x1c = min(H_ds,y1), min(W_ds,x1)
+            p = wsi_ds[y0c:y1c, x0c:x1c, :]
+            p = np.pad(p,
+                       ((pt,pb),(pl,pr),(0,0)),
+                       mode='constant', constant_values=0)
+            seq.append(p.transpose(2,0,1))  # → [3,H,W]
+    patch_seqs[i] = np.stack(seq,0)
+
+print("Patch sequences:", patch_seqs.shape)
+
+# ──────────────────────────────
+# 4. Build neighbor matrix (global slide)
+# ──────────────────────────────
+coords_xy = coords.astype(float)
+dists = cdist(coords_xy, coords_xy)
+neighbors_matrix = ((dists > 0) & (dists <= NEIGHBOR_DISTANCE_THRESHOLD)).astype(float)
+neighbors_matrix = torch.tensor(neighbors_matrix, dtype=torch.float32).to(device)
+
+# ──────────────────────────────
+# 5. Student VRI model definition
+# ──────────────────────────────
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+class VisionBackbone(nn.Module):
+    def __init__(self, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16,32,3,padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten(), nn.Linear(32,out_dim), nn.ReLU()
+        )
+    def forward(self,x):
+        return self.net(x)
+
+class StudentVRI(nn.Module):
+    def __init__(self, Ntok, feat_dim, model_dim, P, nhead, depth, dropout):
+        super().__init__()
+        self.backbone   = VisionBackbone(feat_dim)
+        self.input_proj = nn.Linear(feat_dim, model_dim)
+        self.pos_embed  = nn.Parameter(torch.randn(1,Ntok,model_dim))
+        layer = TransformerEncoderLayer(d_model=model_dim,
+                                        nhead=nhead,
+                                        dropout=dropout,
+                                        batch_first=True)
+        self.transformer = TransformerEncoder(layer, num_layers=depth)
+        self.head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim//2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim//2, P)
+        )
+    def forward(self, x):
+        # x: [B, Ntok, 3,H,W]
+        B,N,C,H,W = x.shape
+        x = x.view(B*N, C, H, W)
+        f = self.backbone(x).view(B, N, -1)      # [B,N,feat_dim]
+        t = self.input_proj(f) + self.pos_embed
+        t = self.transformer(t)                 # [B,N,model_dim]
+        # pool only the **center** token (middle of seq)
+        center = t[:,N//2,:]                    # [B,model_dim]
+        return self.head(center)                # [B,P]
+
+student = StudentVRI(
+    Ntok    = Ntok,
+    feat_dim= BACKBONE_DIM,
+    model_dim=MODEL_DIM,
+    P       = BACKBONE_DIM,
+    nhead   = NUM_HEADS,
+    depth   = TRANSFORMER_DEPTH,
+    dropout = DROPOUT
+).to(device)
+
+print("Student model:", student)
+
+# ──────────────────────────────
+# 6. Dataset and DataLoader
+# ──────────────────────────────
+class DistillDataset(Dataset):
+    def __init__(self, patches, targets):
+        self.patches = torch.from_numpy(patches)
+        self.targets = targets
+    def __len__(self):  return self.patches.shape[0]
+    def __getitem__(self,i):
+        return self.patches[i], self.targets[i]
+
+dl = DistillDataset(patch_seqs, P_target)
+loader = DataLoader(dl, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+# ──────────────────────────────
+# 7. Spatial Incoherence Loss
+# ──────────────────────────────
+def compute_local_morans_I(expression_map, neighbors_matrix, eps=1e-8):
+    # expression_map: (N, P)
+    # neighbors_matrix: (N, N)
+    N, P = expression_map.shape
+    out = []
+    W = neighbors_matrix  # [N, N]
+    W_sum = W.sum()
+    vals = expression_map  # [N, P]
+    mean = vals.mean(axis=0, keepdims=True)  # [1, P]
+    diff = vals - mean
+    num = torch.matmul(W, diff) * diff  # [N, P]
+    num = num.sum(dim=0)  # [P]
+    denom = (diff ** 2).sum(dim=0) + eps  # [P]
+    morans_I = (N / (W_sum + eps)) * (num / denom)
+    return morans_I  # [P]
+
+class SpatialIncoherenceLoss(nn.Module):
+    def __init__(self, loss_weight=1.0):
+        super().__init__()
+        self.loss_weight = loss_weight
+    def forward(self, pred, target, neighbors_matrix):
+        # pred, target: [N, P], neighbors_matrix: [N, N]
+        pred_morans = compute_local_morans_I(pred, neighbors_matrix)
+        target_morans = compute_local_morans_I(target, neighbors_matrix)
+        spatial_loss = nn.functional.mse_loss(pred_morans, target_morans)
+        return self.loss_weight * spatial_loss
+
+spatial_loss_fn = SpatialIncoherenceLoss(loss_weight=SPATIAL_LOSS_WEIGHT)
+mse = nn.MSELoss()
+
+# ──────────────────────────────
+# 8. Training Loop
+# ──────────────────────────────
+opt    = torch.optim.Adam(student.parameters(), lr=LEARNING_RATE)
+
+for epoch in range(1, EPOCHS+1):
+    student.train()
+    tot=0.0
+    for batch_patches, batch_targets in loader:
+        batch_patches = batch_patches.to(device)         # [B,Ntok,3,H,W]
+        batch_targets = batch_targets.to(device)         # [B,P]
+
+        # 1) student forward
+        s_pred = student(batch_patches)                  # [B, P]
+
+        # 2) distill loss (student vs. true PCA targets)
+        loss_main = mse(s_pred, batch_targets)
+
+        # ---- Spatial loss, batch version (optional: do only for full slide) ----
+        # For batch, need to get batch indices in the full slide. Here we assume batch is contiguous.
+        # For best spatial loss, run on all spots after each epoch.
+
+        loss = loss_main
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        tot += loss.item()
+
+    # ---- After epoch, run spatial loss on all spots ----
+    student.eval()
+    with torch.no_grad():
+        all_preds = []
+        for i in range(len(dl)):
+            patch, _ = dl[i]
+            out = student(patch.unsqueeze(0).to(device))[0].cpu()
+            all_preds.append(out)
+        all_preds = torch.stack(all_preds, dim=0).to(device)   # [N_spots, P]
+        gt = P_target
+        spatial_loss = spatial_loss_fn(all_preds, gt, neighbors_matrix).item()
+    print(f"Epoch {epoch:2d} | Distill MSE: {tot/len(loader):.6f} | Spatial Loss: {spatial_loss:.6f}")
+
+print("✅ Training complete.")
+
+# ──────────────────────────────
+# 9. Save Model
+# ──────────────────────────────
+torch.save(student.state_dict(), "student_vri_spatial.pt")
+print("✅ Saved weights → student_vri_spatial.pt")
+
+# ──────────────────────────────
+# 10. Sanity Check Plot
+# ──────────────────────────────
+student.eval()
+with torch.no_grad():
+    x0, target0 = dl[0]
+    s0 = student(x0.unsqueeze(0).to(device))[0].cpu().numpy()
+    true_pca = scaler.inverse_transform(P_raw)[0]
+    stud_pca = scaler.inverse_transform(s0.reshape(1,-1))[0]
+
+plt.figure(figsize=(6,4))
+plt.plot(true_pca, label="True PCA", lw=2)
+plt.plot(stud_pca,  ':', label="Student PCA", lw=2)
+plt.title("Student VRI+Spatial (First Spot)")
+plt.xlabel("PCA component index")
+plt.ylabel("Component value")
+plt.legend()
+plt.show()
+
