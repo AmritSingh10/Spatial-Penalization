@@ -1,0 +1,358 @@
+"""
+method 2
+
+joint method: train VRI model (input is img patch and coords visium ST data) and transformer model (input is pathway expr and coords of neighboring spots, using same input data as method 1)
+fit into nn prediction head
+output should be pathway predictions
+
+to confirm approach and:
+input:
+output:
+
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell: Align slide IDs between your .h5ad and patch .npy filenames
+# ──────────────────────────────────────────────────────────────────────────────
+import os, glob
+import scanpy as sc
+
+# 1) Directories
+H5AD_DIR  = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata"
+PATCH_DIR = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches"
+
+# 2) Locate your single .h5ad file
+h5ad_paths = sorted(glob.glob(os.path.join(H5AD_DIR, "*.h5ad")))
+if len(h5ad_paths) != 1:
+    raise RuntimeError(f"Expected exactly 1 .h5ad in {H5AD_DIR}, found {len(h5ad_paths)}")
+old_h5ad = h5ad_paths[0]
+old_prefix = os.path.splitext(os.path.basename(old_h5ad))[0]
+print("Current AnnData filename prefix:", old_prefix)
+
+# 3) Inspect its .uns dictionary (for reference)
+adata = sc.read_h5ad(old_h5ad)
+print("adata.uns keys:", list(adata.uns.keys()))
+
+# 4) Discover the slide prefix used by your patch files
+patch_files = glob.glob(os.path.join(PATCH_DIR, "*.npy"))
+patch_prefixes = {os.path.basename(p).split("_")[0] for p in patch_files}
+if len(patch_prefixes) != 1:
+    raise RuntimeError(f"Found multiple slide prefixes in patches: {patch_prefixes}")
+new_prefix = patch_prefixes.pop()
+print("Patch directory uses slide prefix:", new_prefix)
+
+# 5) Rename the .h5ad file to match
+if old_prefix != new_prefix:
+    new_h5ad = os.path.join(H5AD_DIR, new_prefix + ".h5ad")
+    os.rename(old_h5ad, new_h5ad)
+    print(f"Renamed AnnData file:\n  {old_h5ad}\n→{new_h5ad}")
+else:
+    print("AnnData prefix already matches patch prefix — no rename needed.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell: Inspect both H5AD_DIR and PATCH_ROOT
+# ──────────────────────────────────────────────────────────────────────────────
+import os
+
+# 1) Your AnnData folder (we saw these)
+H5AD_DIR   = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata"
+print("H5AD_DIR contents (first 10):", os.listdir(H5AD_DIR)[:10])
+
+# 2) Your base patches folder (replace with the right root if nested)
+PATCH_ROOT = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches"
+print("PATCH_ROOT contents (first 10):", os.listdir(PATCH_ROOT)[:10])
+
+# 3) If PATCH_ROOT contains subfolders, drill into each one:
+for sub in os.listdir(PATCH_ROOT):
+    path = os.path.join(PATCH_ROOT, sub)
+    if os.path.isdir(path):
+        print(f"\nSubfolder '{sub}' contains {len(os.listdir(path))} entries; sample files:", os.listdir(path)[:5])
+        # stop after one subfolder
+        break
+
+for fn in os.listdir(H5AD_DIR):
+    if fn.endswith(".h5ad"):
+        print("Example .h5ad:", fn)
+        break
+
+
+for root, dirs, files in os.walk(PATCH_ROOT):
+    for fn in files:
+        if fn.endswith(".npy"):
+            print("Example patch:", fn)
+            print("Located in:", root)
+            break
+    break
+
+import numpy as np
+patch = np.load("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches/100_A11_3/100_A11_3_0.npy")
+patch.shape
+
+!ls /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches/
+
+! ls /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches/0_B4_3_orig
+
+! ls /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches/0_B11_3_orig
+
+import numpy as np
+img_patch = np.load("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/multimodal/tme_study/colon_st/dh_colon/patches/0_B11_3_orig/0_B11_3_orig_1123.npy")
+img_patch.shape
+
+!cat /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata/colon_h5ad_to_deident_map.csv
+
+!ls /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata
+
+import scanpy as sc
+adata = sc.read_h5ad("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata/0.h5ad")
+adata
+
+sc.pl.spatial(adata, color=None, spot_size=150)
+
+sc.pl.spatial(adata, color=['in_tissue', 'EPCAM'], spot_size=200)
+
+import scanpy as sc
+adata10 = sc.read_h5ad("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/colon_main/preprocessed/adata/10.h5ad")
+adata10
+
+sc.pl.spatial(adata10, color=None, spot_size=150)
+
+# use above map (or colon metadata dm_57_samples_updated_12-9-24.csv file from colon_main repo) to make a python dict, then can map and match adata files to respective patch folders
+map_dict = {"0_B11-10_A5_1_adata.h5ad": "0",
+           ...
+           }
+
+"""
+0_B11-10_A5_1_adata.h5ad,0
+83-3_0_adata.h5ad,3
+127_A8-6_0_adata.h5ad,6
+0_B11-10_A5_0_adata.h5ad,10
+11_C9-30_A6_0_adata.h5ad,11
+116_A5-13_A7_0_adata.h5ad,13
+91_A4-14_A4_0_adata.h5ad,14
+40_B10-18_G4_0_adata.h5ad,18
+28_A9-74_A3_1_adata.h5ad,28
+092534_0_adata.h5ad,29
+11_C9-30_A6_1_adata.h5ad,30
+092534_1_adata.h5ad,34
+36_B19-49_A13_1_adata.h5ad,36
+51_A10-38_0_adata.h5ad,38
+40_B10-18_G4_1_adata.h5ad,40
+46_A31-111_B6_1_adata.h5ad,46
+36_B19-49_A13_0_adata.h5ad,49
+51_A10-38_1_adata.h5ad,51
+100-52_0_adata.h5ad,52
+106_A4-60_B3_0_adata.h5ad,60
+092146_1_adata.h5ad,72
+091759_1_adata.h5ad,73
+28_A9-74_A3_0_adata.h5ad,74
+80_A12-96_A8_1_adata.h5ad,80
+97_A7-81_A11_0_adata.h5ad,81
+83-3_1_adata.h5ad,83
+091759_0_adata.h5ad,86
+91_A4-14_A4_1_adata.h5ad,91
+80_A12-96_A8_0_adata.h5ad,96
+97_A7-81_A11_1_adata.h5ad,97
+100-52_1_adata.h5ad,100
+128_B9-102_B12_0_adata.h5ad,102
+106_A4-60_B3_1_adata.h5ad,106
+092146_0_adata.h5ad,107
+46_A31-111_B6_0_adata.h5ad,111
+116_A5-13_A7_1_adata.h5ad,116
+data_0_adata.h5ad,117
+092842_1_adata.h5ad,119
+092842_0_adata.h5ad,122
+127_A8-6_1_adata.h5ad,127
+128_B9-102_B12_1_adata.h5ad,128
+"""
+
+# examine 1 adata and corresponding folder of image patches
+
+
+
+
+# Cell 2: Load AnnData coords & match to patches by grid index
+# 1) read the slide’s AnnData
+ad       = sc.read_h5ad(H5AD_PATH)
+expr_mat = ad.X[:MAX_SPOTS]                           # (N_spots, n_pathways)
+n_path   = expr_mat.shape[1]
+print("Expression matrix:", expr_mat.shape)
+
+# 2) get true pixel‐space coords (x=col, y=row) from .obsm
+#    shape (N_spots,2): columns are [x_pix, y_pix]
+if "spatial" not in ad.obsm:
+    raise KeyError("adata.obsm['spatial'] missing")
+spots_xy = ad.obsm["spatial"][:expr_mat.shape[0], :]
+print("Sample pixel coords:", spots_xy[:5])
+
+# 3) compute integer grid indices
+#    col_idx = floor(x / PATCH_SIZE),  row_idx = floor(y / PATCH_SIZE)
+grid_cols = (spots_xy[:, 0] // PATCH_SIZE).astype(int)
+grid_rows = (spots_xy[:, 1] // PATCH_SIZE).astype(int)
+
+# 4) build “A1” style labels
+coords = [f"{chr(ord('A')+r)}{c+1}" for r,c in zip(grid_rows, grid_cols)]
+print("Sample grid coords:", coords[:5])
+
+# 5) list all patch files (no extension filter)
+patch_files = glob.glob(os.path.join(PATCH_DIR, "*"))
+print("Found patch files:", len(patch_files))
+
+# 6) match each spot → first patch whose basename contains “_{coord}_”
+feat_list, expr_list = [], []
+for coord, vec in zip(coords, expr_mat):
+    # find any file with “_{coord}_” in its name
+    match = next((p for p in patch_files if f"_{coord}_" in os.path.basename(p)), None)
+    if match is None:
+        print(f"No patch containing _{coord}_ → skipping")
+        continue
+    arr = np.load(match, allow_pickle=True)
+    feat_list.append(arr.ravel())
+    expr_list.append(vec)
+
+if not feat_list:
+    raise RuntimeError("❌ No spot↔patch matches found!  Check PATCH_DIR & coord logic.")
+
+feat_all = np.vstack(feat_list)   # (N_matched, raw_feat_dim)
+expr_all = np.vstack(expr_list)   # (N_matched, n_path)
+
+print("Matched samples:", feat_all.shape, expr_all.shape)
+
+# 7) PCA‐reduce to BACKBONE_DIM
+scaler   = StandardScaler()
+f_scl    = scaler.fit_transform(feat_all)
+pca      = PCA(n_components=BACKBONE_DIM)
+feat_pca = pca.fit_transform(f_scl)
+
+print("After PCA:", feat_pca.shape)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 3: Dataset & DataLoader
+# ──────────────────────────────────────────────────────────────────────────────
+class SpatialDS(Dataset):
+    def __init__(self, X_feat, X_expr):
+        self.Xf = torch.from_numpy(X_feat).float()
+        self.Xe = torch.from_numpy(X_expr).float()
+        self.Y  = self.Xe.clone()
+    def __len__(self):
+        return len(self.Y)
+    def __getitem__(self, i):
+        return self.Xf[i], self.Xe[i], self.Y[i]
+
+# train/val split
+N   = feat_pca.shape[0]
+idx = np.random.permutation(N)
+cut = int(0.8 * N)
+train_idx, val_idx = idx[:cut], idx[cut:]
+
+train_loader = DataLoader(SpatialDS(feat_pca[train_idx], expr_all[train_idx]),
+                          batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(SpatialDS(feat_pca[val_idx],   expr_all[val_idx]),
+                          batch_size=BATCH_SIZE)
+
+print("Train/Val sizes:", len(train_loader.dataset), len(val_loader.dataset))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 4: Define Transformer & Combined Model
+# ──────────────────────────────────────────────────────────────────────────────
+class ExprTransformer(nn.Module):
+    def __init__(self, expr_dim, model_dim, depth, heads, dropout):
+        super().__init__()
+        self.in_proj = nn.Linear(expr_dim, model_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=depth)
+        self.out_proj= nn.Linear(model_dim, model_dim)
+
+    def forward(self, x):
+        x = self.in_proj(x).unsqueeze(1)    # → (B,1,model_dim)
+        x = self.encoder(x).squeeze(1)      # → (B,model_dim)
+        return self.out_proj(x)            # → (B,model_dim)
+
+class CombinedModel(nn.Module):
+    def __init__(self, bd, expr_dim, md, depth, heads, dropout, out_dim):
+        super().__init__()
+        self.backbone = nn.Linear(bd, md)
+        self.transformer = ExprTransformer(expr_dim, md, depth, heads, dropout)
+        self.fusion = nn.Sequential(
+            nn.Linear(md*2, md), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(md, out_dim)
+        )
+
+    def forward(self, xf, xe):
+        im = self.backbone(xf)              # (B,md)
+        tr = self.transformer(xe)           # (B,md)
+        return self.fusion(torch.cat([im,tr], dim=1))  # (B,out_dim)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 5: Load pretrained Transformer & instantiate CombinedModel
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) load pretrained only transformer
+pre = ExprTransformer(
+    expr_dim  = n_pathways,
+    model_dim = MODEL_DIM,
+    depth     = TRANSFORMER_DEPTH,
+    heads     = NUM_HEADS,
+    dropout   = DROPOUT
+).to(device)
+pre.load_state_dict(torch.load(CKPT_PATH, map_location=device))
+print("✅ Loaded pretrained transformer")
+
+# 2) build combined and copy in weights
+model = CombinedModel(
+    bd       = BACKBONE_DIM,
+    expr_dim = n_pathways,
+    md       = MODEL_DIM,
+    depth    = TRANSFORMER_DEPTH,
+    heads    = NUM_HEADS,
+    dropout  = DROPOUT,
+    out_dim  = n_pathways
+).to(device)
+model.transformer.load_state_dict(pre.state_dict())
+
+# 3) optimizer + loss
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+criterion = nn.MSELoss()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 6: Training & Validation Loop
+# ──────────────────────────────────────────────────────────────────────────────
+train_losses, val_losses = [], []
+
+for epoch in range(1, EPOCHS+1):
+    # — training —
+    model.train()
+    run_loss = 0.0
+    for xf, xe, y in train_dl:
+        xf, xe, y = xf.to(device), xe.to(device), y.to(device)
+        pred = model(xf, xe)
+        loss = criterion(pred, y)
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        run_loss += loss.item() * xf.size(0)
+    train_loss = run_loss / len(train_dl.dataset)
+    train_losses.append(train_loss)
+
+    # — validation —
+    model.eval()
+    run_loss = 0.0
+    with torch.no_grad():
+        for xf, xe, y in val_dl:
+            xf, xe, y = xf.to(device), xe.to(device), y.to(device)
+            run_loss += criterion(model(xf, xe), y).item() * xf.size(0)
+    val_loss = run_loss / len(val_dl.dataset)
+    val_losses.append(val_loss)
+
+    print(f"Epoch {epoch}/{EPOCHS}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 7: Plot Training & Validation Loss
+# ──────────────────────────────────────────────────────────────────────────────
+plt.figure(figsize=(6,4))
+plt.plot(range(1,EPOCHS+1), train_losses, label="Train")
+plt.plot(range(1,EPOCHS+1), val_losses,   label="Val")
+plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+plt.title("Method 2: VRI + Transformer")
+plt.legend(); plt.show()
