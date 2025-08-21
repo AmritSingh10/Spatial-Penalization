@@ -1,0 +1,292 @@
+"""
+method 1
+
+train transformer based loss model (use VRI base model?) (utilizes masking, and inferring masked regions using neighboring visium spots)
+
+to confirm approach and:
+input:
+output:
+
+"""
+
+# Cell 1: Imports & Hyperparameters
+import os, glob
+import numpy as np
+import scipy.sparse as sp
+import scanpy as sc
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+
+# Paths & training hyperparams
+
+H5AD_DIR          = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/data/adatas"
+NPY_DIR           = "/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/data/metadata"
+MASK_RATIO        = 0.15 # fraction of entries to mask
+BATCH_SIZE        = 8
+EPOCHS            = 50
+MODEL_DIM         = 64
+TRANSFORMER_DEPTH = 4
+NUM_HEADS         = 8
+LEARNING_RATE     = 1e-3
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+class MaskedExprDataset(Dataset):
+    def __init__(self, file_paths, mask_ratio=0.15, min_len=None):
+        self.files      = file_paths
+        self.mask_ratio = mask_ratio
+        self.min_len    = min_len
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        X = np.load(self.files[idx])        
+        X = X[:self.min_len, :]
+        mat = torch.from_numpy(X)
+        mask = (torch.rand_like(mat) < self.mask_ratio)
+        inp = mat.clone()
+        inp[mask] = 0.0
+        return inp, mat, mask
+
+# --- MAIN ---
+all_fns = sorted(glob.glob(os.path.join(NPY_DIR, "*.npy")))  # change extension
+
+print("Found", len(all_fns), "slides")
+
+seq_lens = []
+for fn in all_fns:
+    X = np.load(fn)                       # load numpy array
+    seq_lens.append(X.shape[0])
+min_len = min(seq_lens)
+print("Trimming every slide to the minimum number of spots:", min_len)
+
+dataset    = MaskedExprDataset(all_fns, mask_ratio=MASK_RATIO, min_len=min_len)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+print("Dataset size:", len(dataset), "slides; batches of", BATCH_SIZE)
+
+
+# Cell 2: Dataset definition & load _all_ slides
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+class MaskedExprDataset(Dataset):
+    def __init__(self, matrices, mask_ratio=0.15):
+        """
+        matrices: list of NumPy arrays, each shape = [SEQ_LEN, FEATURE_DIM]
+        """
+        self.mats       = [torch.from_numpy(m) for m in matrices]
+        self.mask_ratio = mask_ratio
+
+    def __len__(self):
+        return len(self.mats)
+
+    def __getitem__(self, idx):
+        mat  = self.mats[idx]                               # [SEQ_LEN, FEATURE_DIM]
+        mask = (torch.rand_like(mat) < self.mask_ratio)     # bool mask
+        inp  = mat.clone()
+        inp[mask] = 0.0
+        return inp, mat, mask
+
+all_fns = sorted(glob.glob(os.path.join(H5AD_DIR, "*.h5ad")))
+print("Found", len(all_fns), "slides")
+
+expr_matrices = []
+for fn in all_fns:
+    adata = sc.read_h5ad(fn)
+    X = adata.X
+    if sp.issparse(X):
+        X = X.A
+    # log1p + global [0,1] scale
+    X = np.log1p(X.astype(np.float32))
+    X = X / (X.max() + 1e-9)
+    expr_matrices.append(X)
+    print(" •", os.path.basename(fn), "→", X.shape)
+
+seq_lens = [m.shape[0] for m in expr_matrices]
+min_len  = min(seq_lens)
+print("Trimming every slide to the minimum number of spots:", min_len)
+
+expr_matrices = [m[:min_len, :] for m in expr_matrices]
+SEQ_LEN, FEATURE_DIM = expr_matrices[0].shape
+print("All matrices now: SEQ_LEN={} × FEATURE_DIM={}".format(SEQ_LEN, FEATURE_DIM))
+
+dataset    = MaskedExprDataset(expr_matrices, mask_ratio=MASK_RATIO)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+print("Dataset size:", len(dataset), "slides; batches of", BATCH_SIZE)
+
+# can incorporate base (foundation) model (taken from VRI svg1000 training workflow, employs UNI model)
+def load_base_model(): 
+    model = timm.create_model(
+    "vit_large_patch16_224", img_size=224, patch_size=16, init_values=1e-5, num_classes=0
+    
+    )
+    model.load_state_dict(torch.load("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Skin_ST_Training/UNI/pytorch_model.bin", map_location="cpu"), strict=True)
+    return model
+
+
+class UNI_ft(nn.Module):
+    def __init__(self, encoder): 
+        super().__init__()
+        self.encoder = encoder
+        for param in self.encoder.parameters(): 
+            param.requires_grad = False
+        
+        self.projection_head = nn.Sequential(
+            nn.Linear(1024, 1024), 
+            nn.BatchNorm1d(1024),
+            nn.ReLU(), 
+            nn.Dropout(0.3), 
+            nn.Linear(1024, 1024), 
+            nn.BatchNorm1d(1024),
+            nn.ReLU(), 
+            nn.Dropout(0.3), 
+            nn.Linear(1024, 1000)
+        )
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.projection_head(x)
+        return x
+
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+def get_augmentation_pipeline(img_size):
+    pipeline = A.Compose([
+        A.Resize(img_size, img_size),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=30, p=0.3, border_mode=0),
+        A.CoarseDropout(max_holes=8, max_height=16, max_width=16, min_holes=None, min_height=None, min_width=None, fill_value=0, p=0.3),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # these are values using the whole dataset, could be an issue here, tbd
+        ToTensorV2(),
+    ])
+
+    return pipeline
+
+def get_testing_pipeline(img_size): 
+    pipeline = A.Compose([
+            A.Resize(img_size, img_size), 
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # these are values using the whole dataset, could be an issue here, tbd
+            ToTensorV2(),
+        ])
+    return pipeline
+
+# Usage
+img_size = 224 
+augmentation_pipeline = get_augmentation_pipeline(img_size)
+testing_pipeline = get_testing_pipeline(img_size) 
+
+# Cell 3: Transformer definition + masked‐MSE loss
+class ExprTransformer(nn.Module):
+    def __init__(self, seq_len, feature_dim, model_dim, nhead, depth, dropout=0.1):
+        super().__init__()
+        self.input_proj  = nn.Linear(feature_dim, model_dim)
+        self.pos_embed   = nn.Parameter(torch.randn(1, seq_len, model_dim))
+        encoder_layer    = nn.TransformerEncoderLayer(
+                              d_model=model_dim,
+                              nhead=nhead,
+                              dropout=dropout,
+                              batch_first=True
+                          )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.output_proj = nn.Linear(model_dim, feature_dim)
+
+    def forward(self, x):
+        # x: [B, SEQ_LEN, FEATURE_DIM]
+        x = self.input_proj(x) + self.pos_embed  # [B, SEQ_LEN, MODEL_DIM]
+        x = self.transformer(x)                  # [B, SEQ_LEN, MODEL_DIM]
+        return self.output_proj(x)               # [B, SEQ_LEN, FEATURE_DIM]
+
+def masked_mse_loss(pred, target, mask):
+    # pred, target: [B,SEQ_LEN,FEATURE_DIM], mask: bool same shape
+    diff = (pred - target)[mask]
+    return (diff*diff).mean()
+
+# Cell 4: Training loop (with automatic CPU fallback)
+# assume ExprTransformer, SEQ_LEN, FEATURE_DIM, etc. are all defined above
+import torch
+
+PREFERRED = torch.device("cuda")
+FALLBACK  = torch.device("cpu")
+
+model = ExprTransformer(
+    seq_len     = SEQ_LEN,
+    feature_dim = FEATURE_DIM,
+    model_dim   = MODEL_DIM,
+    nhead       = NUM_HEADS,
+    depth       = TRANSFORMER_DEPTH,
+    dropout     = 0.1
+)
+try:
+    model = model.to(PREFERRED)
+    # run a trivial check to make sure it's really there
+    torch.zeros(1).to(PREFERRED)
+    DEVICE = PREFERRED
+    print("Training on GPU")
+except Exception as gpu_err:
+    DEVICE = FALLBACK
+    model = model.to(DEVICE)
+    print("GPU not available, falling back to CPU:", gpu_err)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+for epoch in range(1, EPOCHS+1):
+    model.train()
+    running_loss = 0.0
+
+    for inp, orig, mask in dataloader:
+        # inp: [1, SEQ_LEN, FEATURE_DIM], orig/mask the same
+        inp, orig, mask = inp.to(DEVICE), orig.to(DEVICE), mask.to(DEVICE)
+
+        pred = model(inp)                          # [1, SEQ_LEN, FEATURE_DIM]
+        loss = masked_mse_loss(pred, orig, mask)   # only on masked entries
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    avg = running_loss / len(dataloader)
+    print(f"Epoch {epoch:2d} | Avg Masked-MSE: {avg:.6f}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cell 5: Save the fully-trained transformer
+# ──────────────────────────────────────────────────────────────────────────────
+torch.save(model.state_dict(), "expr_transformer_pretrained.pt")
+print("✅ Saved pretrained weights → expr_transformer_pretrained.pt")
+
+# Cell 6: Sanity‐Check Reconstruction
+
+model.eval()
+with torch.no_grad():
+    inp, orig, mask = dataset[0]                          # [SEQ_LEN,FEATURE_DIM] each
+    pred = model(inp.unsqueeze(0).to(device))             # [1,SEQ_LEN,FEATURE_DIM]
+    pred = pred.squeeze(0).cpu()
+
+# scatter true vs pred only on masked entries
+idxs      = mask.nonzero(as_tuple=False)  # [[i,j],...]
+true_vals = orig[idxs[:,0], idxs[:,1]]
+pred_vals = pred[idxs[:,0], idxs[:,1]]
+
+plt.figure(figsize=(5,4))
+plt.scatter(true_vals, pred_vals, s=5, alpha=0.6)
+mn, mx = true_vals.min(), true_vals.max()
+plt.plot([mn,mx],[mn,mx],'r--')
+plt.xlabel("True Value")
+plt.ylabel("Predicted Value")
+plt.title("Transformer on Masked Spots (Real Data)")
+plt.show()
+
+
+
